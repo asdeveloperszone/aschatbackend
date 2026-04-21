@@ -134,7 +134,11 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'x-api-secret']
 }));
 
-app.use(express.json({ limit: '50kb' }));
+// FIX: /api/subscribe uses a higher limit because the push subscription object
+// can be large on some browsers. /api/send only needs small JSON payloads.
+app.use('/api/subscribe', express.json({ limit: '512kb' }));
+app.use('/api/send',      express.json({ limit: '50kb' }));
+app.use(express.json({ limit: '100kb' }));
 
 function requireSecret(req, res, next) {
   if (req.headers['x-api-secret'] !== API_SECRET) {
@@ -169,8 +173,23 @@ app.post('/api/subscribe', async (req, res) => {
     return res.status(400).json({ error: 'Missing userID or subscription object' });
   }
 
+  // FIX: only save the fields web-push actually needs — endpoint and keys.
+  // Reject any extra fields (e.g. accidental base64 photo blobs) that would
+  // bloat Firebase and cause PayloadTooLargeError on future requests.
+  const cleanSub = {
+    endpoint: subscription.endpoint,
+    keys: {
+      p256dh: subscription.keys.p256dh,
+      auth:   subscription.keys.auth
+    }
+  };
+
+  if (!cleanSub.keys.p256dh || !cleanSub.keys.auth) {
+    return res.status(400).json({ error: 'Subscription missing p256dh or auth key' });
+  }
+
   try {
-    await addSubscription(userID, subscription);
+    await addSubscription(userID, cleanSub);
     const subs = await getSubscriptions(userID);
     console.log(`[Subscribe] User ${userID} — devices registered: ${subs.length}`);
     res.json({ ok: true });
@@ -315,3 +334,15 @@ app.listen(PORT, () => {
   console.log(`[ASChat Push] Server running on port ${PORT}`);
   console.log(`[ASChat Push] VAPID public key: ${VAPID_PUBLIC_KEY.slice(0, 20)}...`);
 });
+
+// ─── GLOBAL ERROR HANDLER ─────────────────────────────────────────────────────
+// Catches PayloadTooLargeError and other Express middleware errors cleanly
+// instead of crashing the process or returning an unformatted 500.
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body too large' });
+  }
+  console.error('[Server] Unhandled error:', err.message);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
